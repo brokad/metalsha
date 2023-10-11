@@ -1,7 +1,10 @@
 [package]
-name = "metalsha-benchmark"
+name = "metalsha"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "metalsha"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

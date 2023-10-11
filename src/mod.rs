@@ -1,20 +1,55 @@
 use std::path::Path;
+use std::pin::Pin;
+use std::ptr::null;
 use std::slice;
 use metal::*;
 use objc::rc::autoreleasepool;
 
-fn create_pipeline_state<P: AsRef<Path>>(path: P, device: &Device) -> ComputePipelineState {
-    let library = device.new_library_with_file(path).unwrap();
-    let kernel = library.get_function("add_arrays", None).unwrap();
+const SHA1_METAL_MODULE: &[u8] = include_bytes!("lol");
 
-    let pipeline_state_descriptor = ComputePipelineDescriptor::new();
-    pipeline_state_descriptor.set_compute_function(Some(&kernel));
+struct Sha1Inner {
+    inlen: usize
+}
 
-    device
-        .new_compute_pipeline_state_with_function(
-            pipeline_state_descriptor.compute_function().unwrap()
-        )
-        .unwrap()
+pub struct Sha1 {
+    device: Device,
+    command_queue: CommandQueue,
+    inner: Pin<Box<Sha1Inner>>,
+    pipeline_state: ComputePipelineState
+}
+
+impl Sha1 {
+    pub fn new(inlen: usize) -> Self {
+        let device = Device::system_default().unwrap();
+        let command_queue = device.new_command_queue();
+
+        let library = device.new_library_with_data(SHA1_METAL_MODULE).unwrap();
+
+        let inner = Box::pin(Sha1Inner {
+            inlen
+        });
+
+        let constants = FunctionConstantValues::new();
+        let inner_p = unsafe { std::mem::transmute(&inner.as_ref().get_ref().inlen) };
+        constants.set_constant_value_with_name(inner_p, MTLDataType::UInt, "inlen");
+        let kernel = library.get_function("kernel_sha1_hash", Some(constants)).unwrap();
+
+        let pipeline_state_descriptor = ComputePipelineDescriptor::new();
+        pipeline_state_descriptor.set_compute_function(Some(&kernel));
+
+        let pipeline_state = device
+            .new_compute_pipeline_state_with_function(
+                pipeline_state_descriptor.compute_function().unwrap()
+            )
+            .unwrap();
+
+        Self {
+            device,
+            command_queue,
+            pipeline_state,
+            inner
+        }
+    }
 }
 
 fn create_input_and_output_buffers(device: &Device, num_elements: usize) -> ((Buffer, Buffer), Buffer) {
@@ -41,9 +76,6 @@ fn main() {
     autoreleasepool(|| {
         let num_elements = 1024 * 64 * 64;
 
-        let device = Device::system_default().unwrap();
-
-        let command_queue = device.new_command_queue();
         let command_buffer = command_queue.new_command_buffer();
 
         let compute_pass_descriptor = ComputePassDescriptor::new();
