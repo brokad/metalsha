@@ -144,16 +144,15 @@ void metal_sha1_final(thread SHA1_CTX *ctx,
 }
 
 kernel void kernel_sha1_hash(device const BYTE *indata [[buffer(0)]],
-                             constant WORD *inlen [[buffer(1)]],
+                             device const WORD *framelen [[buffer(1)]],
                              device BYTE *outdata [[buffer(2)]],
                              uint gid [[thread_position_in_grid]])
 {
     thread SHA1_CTX ctx;
-    const WORD len = *inlen;
-    device const BYTE *in = indata + len * gid;
+    device const BYTE *in = indata + *framelen * gid;
     device BYTE *out = outdata + SHA1_DIGEST_SIZE * gid;
     
     metal_sha1_init(&ctx);
-    metal_sha1_update(&ctx, in, len);
+    metal_sha1_update(&ctx, in, *framelen);
     metal_sha1_final(&ctx, out);
 }
