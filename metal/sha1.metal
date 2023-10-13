@@ -1,7 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#include "sha1.hpp"
+#include "digest.h"
+#include "sha1.h"
 
 #ifndef ROTLEFT
 #define ROTLEFT(a,b) (((a) << (b)) | ((a) >> (32-(b))))
@@ -82,9 +83,9 @@ void metal_sha1_init(thread SHA1_CTX *ctx)
 
 void metal_sha1_update(thread SHA1_CTX *ctx, 
                        device const BYTE *in,
-                       WORD len)
+                       uint64_t len)
 {
-    WORD i;
+    uint64_t i;
     
     for (i = 0; i < len; i++) {
         ctx->data[ctx->datalen] = in[i];
@@ -144,15 +145,16 @@ void metal_sha1_final(thread SHA1_CTX *ctx,
 }
 
 kernel void kernel_sha1_hash(device const BYTE *indata [[buffer(0)]],
-                             device const WORD *framelen [[buffer(1)]],
-                             device BYTE *outdata [[buffer(2)]],
+                             device BYTE *outdata [[buffer(1)]],
+                             device const DIGEST_ARGS *args [[buffer(2)]],
                              uint gid [[thread_position_in_grid]])
 {
     thread SHA1_CTX ctx;
-    device const BYTE *in = indata + *framelen * gid;
+    uint64_t inlen = args->inlen;
+    device const BYTE *in = indata + inlen * gid;
     device BYTE *out = outdata + SHA1_DIGEST_SIZE * gid;
     
     metal_sha1_init(&ctx);
-    metal_sha1_update(&ctx, in, *framelen);
+    metal_sha1_update(&ctx, in, inlen);
     metal_sha1_final(&ctx, out);
 }
