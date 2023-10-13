@@ -1,9 +1,9 @@
+use std::cmp::max;
 use std::fmt;
 use std::slice;
 use std::mem;
+use std::ops::Range;
 use metal::*;
-
-pub mod sha1;
 
 const METAL_MODULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/metalsha.metallib"));
 
@@ -35,45 +35,263 @@ impl<O> ResultExt<O> for Result<O, String> {
     }
 }
 
-pub trait Digest<'r> {
-    fn from_hasher(hasher: &'r Hasher) -> Self;
+pub trait Digest {
+    const DIGEST_SIZE: usize;
+    const KERNEL_FN: &'static str;
 }
 
-pub struct BatchBuilder {
-    pub(crate) framelen: usize,
-    pub(crate) bsize: usize,
-    pub(crate) asize: usize,
-    pub(crate) buffer: Buffer,
+pub struct Sha1;
+
+impl Digest for Sha1 {
+    const DIGEST_SIZE: usize = 20;
+    const KERNEL_FN: &'static str = "kernel_sha1_hash";
 }
 
-impl BatchBuilder {
-    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+#[repr(C)]
+pub struct DigestRunArgs {
+    inlen: u64
+}
+
+pub struct DigestRunArgsBuffer {
+    buffer: Buffer
+}
+
+impl DigestRunArgsBuffer {
+    fn new_from_buffer(buffer: Buffer) -> Self {
+        assert_eq!(buffer.length() as usize, mem::size_of::<DigestRunArgs>());
+        Self { buffer }
+    }
+
+    pub fn as_ref_mut(&mut self) -> &mut DigestRunArgs {
+        unsafe { mem::transmute(self.buffer.contents()) }
+    }
+
+    pub fn as_ref(& self) -> &DigestRunArgs {
+        unsafe { mem::transmute(self.buffer.contents()) }
+    }
+
+    pub fn as_ref_inner(&self) -> &BufferRef {
+        self.buffer.as_ref()
+    }
+}
+
+pub struct BatchBuffer {
+    frame_length: usize,
+    actual_size: usize,
+    buffer: Buffer,
+}
+
+impl BatchBuffer {
+    pub fn new(buffer: Buffer, frame_length: usize) -> Self {
+        Self {
+            frame_length,
+            actual_size: 0,
+            buffer,
+        }
+    }
+
+    fn as_ref_inner(&self) -> &BufferRef {
+        self.buffer.as_ref()
+    }
+
+    fn as_slice_mut(&mut self) -> &mut [u8] {
         unsafe {
             slice::from_raw_parts_mut(
                 mem::transmute(self.buffer.contents()),
-                self.bsize
+                self.length(),
             )
         }
     }
 
-    pub fn as_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> &[u8] {
         unsafe {
             slice::from_raw_parts(
                 mem::transmute(self.buffer.contents()),
-                self.bsize
+                self.length(),
             )
         }
     }
 
-    pub fn next_frame(&mut self) -> Option<&mut [u8]> {
-        let framestart = self.asize;
-        let frameend = self.asize + self.framelen;
-        if frameend <= self.bsize {
-            self.asize += self.framelen;
-            Some(&mut self.as_slice_mut()[framestart..frameend])
+    pub fn length(&self) -> usize {
+        self.buffer.length() as usize
+    }
+
+    pub fn num_frames(&self) -> usize {
+        (self.actual_size + self.frame_length - 1) / self.frame_length
+    }
+
+    pub fn reset(&mut self) -> &mut Self {
+        self.actual_size = 0;
+        self
+    }
+
+    fn raw_frame_bounds(&self, at: usize) -> Option<Range<usize>> {
+        let frame_start = at - at % self.frame_length;
+        let frame_end = frame_start + self.frame_length;
+
+        if frame_end <= self.length() {
+            Some(frame_start..frame_end)
         } else {
             None
         }
+    }
+
+    fn frame_mut(&mut self, at: usize) -> Option<&mut [u8]> {
+        if let Some(frame) = self.raw_frame_bounds(at) {
+            self.actual_size = max(frame.end, self.actual_size);
+            Some(&mut self.as_slice_mut()[frame])
+        } else {
+            None
+        }
+    }
+
+    fn frame(&self, at: usize) -> Option<&[u8]> {
+        self.raw_frame_bounds(at)
+            .map(|frame| &self.as_slice()[frame])
+    }
+}
+
+pub struct BatchBufferSetter<'r> {
+    at: usize,
+    inner: &'r mut BatchBuffer
+}
+
+impl<'r> BatchBufferSetter<'r> {
+    fn new(batch_buffer: &'r mut BatchBuffer) -> Self {
+        batch_buffer.reset();
+        Self {
+            at: 0,
+            inner: batch_buffer
+        }
+    }
+
+    pub fn next_frame(&'r mut self) -> Option<&'r mut [u8]> {
+        let frame = self.inner.frame_mut(self.at);
+
+        if let Some(frame) = frame.as_ref() {
+            self.at += frame.len();
+        }
+
+        frame
+    }
+}
+
+pub struct BatchBufferReader<'r> {
+    at: usize,
+    inner: &'r BatchBuffer
+}
+
+impl<'r> BatchBufferReader<'r> {
+    fn new(batch_buffer: &'r BatchBuffer) -> Self {
+        Self {
+            at: 0,
+            inner: batch_buffer
+        }
+    }
+
+    pub fn next_frame(&'r mut self) -> Option<&'r [u8]> {
+        let frame = self.inner.frame(self.at);
+
+        if let Some(frame) = frame.as_ref() {
+            self.at += frame.len();
+        }
+
+        frame
+    }
+}
+
+pub struct DigestCommandRun<'r, D> {
+    hasher: &'r Hasher,
+    pipeline_state: ComputePipelineState,
+    input_buffer: BatchBuffer,
+    args_buffer: DigestRunArgsBuffer,
+    output_buffer: BatchBuffer,
+    _digest: D,
+}
+
+impl<'r, D: Digest> DigestCommandRun<'r, D> {
+    fn new(hasher: &'r Hasher, digest: D, inlen: usize, count: usize) -> Self {
+        let input_buffer = hasher.new_batch_buffer(inlen, count);
+        let output_buffer = hasher.new_batch_buffer(D::DIGEST_SIZE, count);
+        let args_buffer = hasher.new_args_buffer();
+
+        let pipeline_state = Self::new_pipeline_state(hasher);
+        Self {
+            hasher,
+            pipeline_state,
+            input_buffer,
+            args_buffer,
+            output_buffer,
+            _digest: digest,
+        }
+    }
+
+    pub fn input_buffer(&mut self) -> BatchBufferSetter<'_> {
+        self.input_buffer.reset();
+        BatchBufferSetter::new(&mut self.input_buffer)
+    }
+
+    pub fn output_buffer(&self) -> BatchBufferReader<'_> {
+        BatchBufferReader::new(&self.output_buffer)
+    }
+
+    fn new_pipeline_state(hasher: &Hasher) -> ComputePipelineState {
+        let kernel = hasher
+            .library()
+            .get_function(D::KERNEL_FN, None)
+            .unwrap();
+
+        let pipeline_state_descriptor = ComputePipelineDescriptor::new();
+        pipeline_state_descriptor.set_compute_function(Some(&kernel));
+        let function = pipeline_state_descriptor.compute_function().unwrap();
+
+        hasher
+            .device()
+            .new_compute_pipeline_state_with_function(function)
+            .unwrap()
+    }
+
+    pub fn run(Self {
+        hasher,
+        pipeline_state,
+        input_buffer,
+        args_buffer,
+        output_buffer,
+        ..
+    }: &mut Self) {
+        let compute_pass_descriptor = ComputePassDescriptor::new();
+        let command_buffer = hasher.new_command_buffer();
+        let encoder = command_buffer
+            .compute_command_encoder_with_descriptor(compute_pass_descriptor);
+        encoder.set_compute_pipeline_state(&pipeline_state);
+
+        args_buffer.as_ref_mut().inlen = input_buffer.frame_length as u64;
+        let output_actual_size = input_buffer.num_frames() * D::DIGEST_SIZE;
+        assert!(output_buffer.length() >= output_actual_size);
+        output_buffer.actual_size = output_actual_size;
+
+        encoder.set_buffer(0, Some(input_buffer.as_ref_inner()), 0);
+        encoder.set_buffer(1, Some(output_buffer.as_ref_inner()), 0);
+        encoder.set_buffer(2, Some(args_buffer.as_ref_inner()), 0);
+
+        let num_threads = pipeline_state.thread_execution_width();
+
+        let thread_group_count = MTLSize {
+            width: ((input_buffer.num_frames() as NSUInteger + num_threads) / num_threads),
+            height: 1,
+            depth: 1,
+        };
+
+        let thread_group_size = MTLSize {
+            width: num_threads,
+            height: 1,
+            depth: 1,
+        };
+
+        encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
     }
 }
 
@@ -106,27 +324,34 @@ impl Hasher {
         self.command_queue.new_command_buffer()
     }
 
-    pub fn digest<'s, D: Digest<'s>>(&'s self) -> D {
-        D::from_hasher(self)
+    pub fn digest<D: Digest>(
+        &self,
+        digest: D,
+        inlen: usize,
+        count: usize
+    ) -> DigestCommandRun<D> {
+        DigestCommandRun::new(self, digest, inlen, count)
     }
 
-    pub fn new_batch(&self, framelen: usize, count: usize) -> BatchBuilder {
-        let bsize = framelen * count;
+    fn new_args_buffer(&self) -> DigestRunArgsBuffer {
+        let buffer = self
+            .device
+            .new_buffer(
+                mem::size_of::<DigestRunArgs>() as u64,
+                MTLResourceOptions::StorageModeShared
+            );
+
+        DigestRunArgsBuffer::new_from_buffer(buffer)
+    }
+
+    fn new_batch_buffer(&self, inlen: usize, count: usize) -> BatchBuffer {
+        let bsize = inlen * count;
 
         let buffer = self
             .device
             .new_buffer(bsize as u64, MTLResourceOptions::StorageModeShared);
 
-        BatchBuilder {
-            framelen,
-            bsize,
-            asize: 0,
-            buffer,
-        }
-    }
-
-    pub fn new_batch_with_data(&self, _data: &[u8]) -> BatchBuilder {
-        todo!()
+        BatchBuffer::new(buffer, inlen)
     }
 
     pub fn library(&self) -> &Library {
