@@ -1,5 +1,5 @@
 use std::cmp::max;
-use std::fmt;
+use std::{error, fmt};
 use std::slice;
 use std::mem;
 use std::ops::Range;
@@ -7,6 +7,7 @@ use metal::*;
 
 const METAL_MODULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/metalsha.metallib"));
 
+#[derive(Debug)]
 pub enum Error {
     Metal(String)
 }
@@ -18,6 +19,8 @@ impl fmt::Display for Error {
         }
     }
 }
+
+impl error::Error for Error {}
 
 mod sealed {
     pub trait Sealed {}
@@ -40,9 +43,9 @@ pub trait Digest {
     const KERNEL_FN: &'static str;
 }
 
-pub struct Sha1;
+pub struct SHA1;
 
-impl Digest for Sha1 {
+impl Digest for SHA1 {
     const DIGEST_SIZE: usize = 20;
     const KERNEL_FN: &'static str = "kernel_sha1_hash";
 }
@@ -146,8 +149,12 @@ impl BatchBuffer {
     }
 
     fn frame(&self, at: usize) -> Option<&[u8]> {
-        self.raw_frame_bounds(at)
-            .map(|frame| &self.as_slice()[frame])
+        if let Some(frame) = self.raw_frame_bounds(at) {
+            if frame.end <= self.actual_size {
+                return Some(&self.as_slice()[frame]);
+            }
+        }
+        None
     }
 }
 
@@ -165,7 +172,7 @@ impl<'r> BatchBufferSetter<'r> {
         }
     }
 
-    pub fn next_frame(&'r mut self) -> Option<&'r mut [u8]> {
+    pub fn next_frame(&mut self) -> Option<&mut [u8]> {
         let frame = self.inner.frame_mut(self.at);
 
         if let Some(frame) = frame.as_ref() {
@@ -189,7 +196,7 @@ impl<'r> BatchBufferReader<'r> {
         }
     }
 
-    pub fn next_frame(&'r mut self) -> Option<&'r [u8]> {
+    pub fn next_frame(&mut self) -> Option<&[u8]> {
         let frame = self.inner.frame(self.at);
 
         if let Some(frame) = frame.as_ref() {
@@ -360,5 +367,54 @@ impl Hasher {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    const IN_LEN: usize = 1024;
+    const IN_COUNT: usize = 255;
+
+    #[test]
+    fn batch_buffer_rw() {
+        let hasher = Hasher::new().unwrap();
+
+        let mut buffer = hasher.new_batch_buffer(IN_LEN, IN_COUNT);
+        let mut buffer_setter = BatchBufferSetter::new(&mut buffer);
+        let buffer_setter_mut = &mut buffer_setter;
+
+        let mut nframe: u8 = 0;
+
+        while let Some(frame) = buffer_setter_mut.next_frame() {
+            assert_eq!(frame.len(), IN_LEN);
+            frame.copy_from_slice(&[nframe; IN_LEN]);
+            nframe += 1;
+            if nframe >= 16 {
+                break
+            }
+        }
+
+        assert_eq!(buffer.actual_size, IN_LEN * 16);
+
+        let mut buffer_reader = BatchBufferReader::new(&buffer);
+
+        nframe = 0;
+
+        while let Some(frame) = buffer_reader.next_frame() {
+            assert_eq!(*frame, [nframe; IN_LEN]);
+            nframe += 1;
+        }
+
+        assert_eq!(nframe, 16);
+    }
+
+    #[test]
+    fn args_buffer_rw() {
+        let hasher = Hasher::new().unwrap();
+        let mut args_buffer = hasher.new_args_buffer();
+        args_buffer.as_ref_mut().inlen = 64;
+        assert_eq!(args_buffer.as_ref().inlen, 64);
     }
 }
