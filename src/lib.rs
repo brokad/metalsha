@@ -172,6 +172,10 @@ impl<'r> BatchBufferSetter<'r> {
         }
     }
 
+    pub fn num_frames(&self) -> usize {
+        self.inner.num_frames()
+    }
+
     pub fn next_frame(&mut self) -> Option<&mut [u8]> {
         let frame = self.inner.frame_mut(self.at);
 
@@ -194,6 +198,10 @@ impl<'r> BatchBufferReader<'r> {
             at: 0,
             inner: batch_buffer
         }
+    }
+
+    pub fn num_frames(&self) -> usize {
+        self.inner.num_frames()
     }
 
     pub fn next_frame(&mut self) -> Option<&[u8]> {
@@ -258,14 +266,16 @@ impl<'r, D: Digest> DigestCommandRun<'r, D> {
             .unwrap()
     }
 
-    pub fn run(Self {
-        hasher,
-        pipeline_state,
-        input_buffer,
-        args_buffer,
-        output_buffer,
-        ..
-    }: &mut Self) {
+    pub fn run(&mut self) {
+        let Self {
+            hasher,
+            pipeline_state,
+            input_buffer,
+            args_buffer,
+            output_buffer,
+            ..
+        } = self;
+
         let compute_pass_descriptor = ComputePassDescriptor::new();
         let command_buffer = hasher.new_command_buffer();
         let encoder = command_buffer
@@ -327,7 +337,7 @@ impl Hasher {
         Self::from_device(Device::system_default().unwrap())
     }
 
-    pub fn new_command_buffer(&self) -> &CommandBufferRef {
+    fn new_command_buffer(&self) -> &CommandBufferRef {
         self.command_queue.new_command_buffer()
     }
 
